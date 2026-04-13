@@ -51,7 +51,18 @@ CREATE TABLE IF NOT EXISTS fct_api_requests (
     cost_usd DOUBLE
 );
 
--- 2.2 账户账单周期快照事实表 (Periodic Snapshot Fact)
+-- 2.2 资金交易事实表 (Financial Transaction Fact)
+CREATE TABLE IF NOT EXISTS fct_account_transactions (
+    transaction_id BIGINT PRIMARY KEY,
+    account_sk INTEGER,
+    amount DOUBLE,
+    order_type VARCHAR,
+    payment_method VARCHAR,
+    transaction_status VARCHAR,
+    created_at TIMESTAMP
+);
+
+-- 2.3 账户账单周期快照事实表 (Periodic Snapshot Fact)
 CREATE TABLE IF NOT EXISTS fct_account_daily_snapshot (
     snapshot_date DATE,
     account_sk INTEGER,

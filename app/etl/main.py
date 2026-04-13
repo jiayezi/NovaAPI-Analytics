@@ -40,15 +40,17 @@ def extract_from_mysql(engine):
     df_api_keys = pd.read_sql("SELECT key_id, user_id FROM api_keys", engine)
     # 对于实际大数据量项目，这里会使用增量抽取。由于我们目前记录不多(10~20万)，全量抽取秒回
     df_logs = pd.read_sql("SELECT * FROM request_logs_raw", engine)
-    return df_users, df_models, df_api_keys, df_logs
+    df_billing = pd.read_sql("SELECT * FROM billing_orders", engine)
+    return df_users, df_models, df_api_keys, df_logs, df_billing
 
-def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs):
+def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billing):
     """在 DuckDB 内存中进行 Transform，并 Load 到星型架构事实表和维度表中"""
     logger.info("注册 DataFrame 到 DuckDB 进行内存级联算...")
     conn.register("src_users", df_users)
     conn.register("src_models", df_models)
     conn.register("src_api_keys", df_api_keys)
     conn.register("src_logs", df_logs)
+    conn.register("src_billing", df_billing)
 
     # 1. 挂载和装配维度表: dim_model
     conn.execute("TRUNCATE TABLE dim_model")
@@ -113,7 +115,29 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs):
     inserted_facts = conn.execute("SELECT COUNT(*) FROM fct_api_requests").fetchone()[0]
     logger.info(f"📈 事务事实表 [fct_api_requests] 装载完成: 共 {inserted_facts} 行记录!")
 
-    # 5. 生成聚合快照事实表: fct_account_daily_snapshot
+    # 5. 装载资金交易事实表: fct_account_transactions
+    logger.info("⚙️ 正在转换和挂载资金交易事实表 [fct_account_transactions]...")
+    conn.execute("TRUNCATE TABLE fct_account_transactions")
+    conn.execute("""
+        INSERT INTO fct_account_transactions (
+            transaction_id, account_sk, amount, order_type, 
+            payment_method, transaction_status, created_at
+        )
+        SELECT 
+            b.order_id,
+            a.account_sk,
+            b.amount,
+            b.order_type,
+            b.payment_method,
+            b.transaction_status,
+            b.created_at
+        FROM src_billing b
+        JOIN dim_account a ON b.user_id = a.user_id AND a.is_current = TRUE
+    """)
+    inserted_trans = conn.execute("SELECT COUNT(*) FROM fct_account_transactions").fetchone()[0]
+    logger.info(f"📈 交易事实表 [fct_account_transactions] 装载完成: 共 {inserted_trans} 行记录!")
+
+    # 6. 生成聚合快照事实表: fct_account_daily_snapshot
     logger.info("⚙️ 正在降维聚合生成每日快照事实表 [fct_account_daily_snapshot]...")
     conn.execute("TRUNCATE TABLE fct_account_daily_snapshot")
     conn.execute("""
@@ -143,10 +167,10 @@ def run_etl():
         init_dw_schema(duckdb_conn)
         
         # 抽取
-        df_users, df_models, df_api_keys, df_logs = extract_from_mysql(mysql_engine)
+        df_users, df_models, df_api_keys, df_logs, df_billing = extract_from_mysql(mysql_engine)
         
         # 转换并装载
-        transform_and_load(duckdb_conn, df_users, df_models, df_api_keys, df_logs)
+        transform_and_load(duckdb_conn, df_users, df_models, df_api_keys, df_logs, df_billing)
         
         duckdb_conn.close()
         logger.info("=== 🎉 ETL 流水线执行成功 (Data Warehouse 已就绪) ===")

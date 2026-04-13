@@ -51,8 +51,7 @@ def generate_users_and_keys(num_users, max_keys):
     # 基准起始时间 (30天前的 0点)
     base_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=settings.generator.simulation_days)
 
-    for i in range(1, num_users + 1):
-        tier = tiers[i-1]
+    for i, tier in enumerate(tiers):
         
         # 模拟不同级别的初始资金
         if tier == 'enterprise':
@@ -76,12 +75,12 @@ def generate_users_and_keys(num_users, max_keys):
         
         # Keys 
         num_k = random.randint(1, max_keys)
-        for _ in range(num_k):
+        for j in range(num_k):
             api_keys.append({
-                'key_id': len(api_keys) + 1,
+                'key_id': j,
                 'user_id': i,
                 'key_name': f"{tier.title()}-Key-{fake.word()}",
-                'api_key': "sk-nova-" + str(uuid.uuid4()).replace('-', ''),
+                'api_key': "sk-nova-" + str(uuid.uuid4()),
                 'created_at': reg_date + timedelta(hours=random.randint(1, 10)),
                 'is_active': True
             })
@@ -106,8 +105,8 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
     start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
     
     # 将模型分类
-    cheap_models = df_models[df_models['input_price_per_1M'] < 1.0]['model_id'].tolist()
-    expensive_models = df_models[df_models['input_price_per_1M'] >= 1.0]['model_id'].tolist()
+    cheap_models = df_models[df_models['output_price_per_1M'] <= 12.0]['model_id'].tolist()
+    expensive_models = df_models[df_models['output_price_per_1M'] > 12.0]['model_id'].tolist()
     
     # 挑选出“黑客用户”和“延迟异常模型”用于后续植入 AI 诊断案例
     hacker_key_id = df_keys[df_keys['user_id'].isin(df_users[df_users['subscription_plan'] == 'free']['user_id'])].iloc[0]['key_id']
@@ -217,7 +216,93 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
     return df_logs
 
 
-def export_or_insert_to_db(df_users, df_keys, df_models, df_logs):
+def simulate_billing_orders(df_users, days=30):
+    """
+    生成财务流水：
+    1. 用户注册时的初始充值 (recharge)。
+    2. Pro/Enterprise 用户的订阅费扣款 (subscription_fee)。
+    3. 模拟周期性的用量结算 (usage_settlement)。
+    """
+    logger.info("正在生成配套的财务账单流水数据...")
+    orders = []
+    order_id_counter = 1
+    
+    for index, user in df_users.iterrows():
+        tier = user['subscription_plan']
+        reg_date = user['registration_date']
+        
+        # 初始充值
+        if tier == 'enterprise':
+            init_amount = np.random.uniform(500, 2000)
+        elif tier == 'pro':
+            init_amount = np.random.uniform(100, 300)
+        else:
+            init_amount = np.random.uniform(5, 50)
+            
+        orders.append({
+            'order_id': order_id_counter,
+            'user_id': user['user_id'],
+            'amount': round(init_amount, 4),
+            'order_type': 'recharge',
+            'payment_method': random.choice(['credit_card', 'paypal', 'alipay']),
+            'transaction_status': 'completed',
+            'created_at': reg_date + timedelta(minutes=random.randint(1, 60))
+        })
+        order_id_counter += 1
+        
+        # 扣减订阅费 (针对 Pro/Enterprise)
+        if tier != 'free':
+            sub_fee = -50.0 if tier == 'pro' else -500.0
+            orders.append({
+                'order_id': order_id_counter,
+                'user_id': user['user_id'],
+                'amount': round(sub_fee, 4),
+                'order_type': 'subscription_fee',
+                'payment_method': 'credit_card',
+                'transaction_status': 'completed',
+                'created_at': reg_date + timedelta(hours=random.randint(1, 12))
+            })
+            order_id_counter += 1
+            
+        # 随机零星充值和用量结算扣费
+        current_time = reg_date + timedelta(days=random.randint(5, 10))
+        while current_time < datetime.now():
+            # 有时充值
+            if random.random() > 0.8:
+                orders.append({
+                    'order_id': order_id_counter,
+                    'user_id': user['user_id'],
+                    'amount': round(np.random.uniform(20, 100), 4),
+                    'order_type': 'recharge',
+                    'payment_method': 'credit_card',
+                    'transaction_status': 'completed',
+                    'created_at': current_time
+                })
+                order_id_counter += 1
+                
+            # 周期性扣费
+            orders.append({
+                'order_id': order_id_counter,
+                'user_id': user['user_id'],
+                'amount': -round(np.random.uniform(1, 15), 4),
+                'order_type': 'usage_settlement',
+                'payment_method': 'balance',
+                'transaction_status': 'completed',
+                'created_at': current_time + timedelta(hours=random.randint(1, 4))
+            })
+            order_id_counter += 1
+            # 步进几天
+            current_time += timedelta(days=random.randint(3, 7))
+            
+    df_orders = pd.DataFrame(orders)
+    if not df_orders.empty:
+        df_orders = df_orders.sort_values(by='created_at').reset_index(drop=True)
+        df_orders['order_id'] = range(1, len(df_orders) + 1)
+    
+    return df_orders
+
+
+def export_or_insert_to_db(df_users, df_keys, df_models, df_logs, df_billing):
     """将数据保存至 MySQL 数据库"""
     try:
         engine = get_engine()
@@ -247,6 +332,9 @@ def export_or_insert_to_db(df_users, df_keys, df_models, df_logs):
         df_models.to_sql('ai_models', con=engine, if_exists='append', index=False)
         logger.info(f"✅ AI Models 导入成功: {len(df_models)} 行")
 
+        df_billing.to_sql('billing_orders', con=engine, if_exists='append', index=False)
+        logger.info(f"✅ Billing Orders 导入成功: {len(df_billing)} 行")
+
         # 为了防止 request logs 太大，分块导入
         chunk_size = 5000
         for i in range(0, len(df_logs), chunk_size):
@@ -264,6 +352,7 @@ def export_or_insert_to_db(df_users, df_keys, df_models, df_logs):
         df_users.to_csv(os.path.join(data_dir, "users.csv"), index=False)
         df_keys.to_csv(os.path.join(data_dir, "api_keys.csv"), index=False)
         df_models.to_csv(os.path.join(data_dir, "ai_models.csv"), index=False)
+        df_billing.to_csv(os.path.join(data_dir, "billing_orders.csv"), index=False)
         df_logs.to_csv(os.path.join(data_dir, "request_logs_raw.csv"), index=False)
         logger.info(f"📁 CSV 备份完毕在 {data_dir}!")
 
@@ -277,12 +366,13 @@ def main():
     
     df_models = generate_reference_data()
     df_users, df_keys = generate_users_and_keys(num_users=num_users, max_keys=max_keys)
+    df_billing = simulate_billing_orders(df_users, days=days)
     df_logs = simulate_request_logs(df_keys, df_users, df_models, days=days)
     
     logger.info(f"🏁 测算完成！共计 {len(df_logs)} 条调用请求流日志.")
     
     # 导进数据库或生成CSV
-    export_or_insert_to_db(df_users, df_keys, df_models, df_logs)
+    export_or_insert_to_db(df_users, df_keys, df_models, df_logs, df_billing)
     logger.info("=== 全部流程生成结束 ===")
 
 if __name__ == "__main__":

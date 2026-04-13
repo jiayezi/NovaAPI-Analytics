@@ -4,7 +4,7 @@ database:
     host: "localhost"
     port: 3306
     user: "root"
-    password: "YOUR_PASSWORD" # 请在 .env 文件中配置此项，不要提交真实密码到 GitHub
+    # password: "YOUR_PASSWORD" # 请在 .env 文件中配置此项，不要提交真实密码到 GitHub。此行需要注释掉，否则会覆盖 .env 文件中的配置。
     database: "nova_api_oltp"
   duckdb:
     path: "data/nova_analytics.db"

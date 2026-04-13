@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # 支持从环境变量读取，优先级最高
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=Path(__file__).parent / ".env",
         env_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore"
