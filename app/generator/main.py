@@ -154,10 +154,13 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
                 
                 # Token 分布：服从对数正态分布 (多数短文本，少数长文本)
                 prompt_tokens = int(np.random.lognormal(mean=5.5, sigma=1.2))
+                # “AI API 聚合服务 SaaS”的流量通常来自企业级应用（如 AI 扣子、智能客服、文档分析器），因此 Prompt 略大于 Completion 是符合目前行业 API 账单特征的
                 completion_tokens = int(np.random.lognormal(mean=4.5, sigma=1.0))
                 
+                # max(5, ...)：确保输入 Token 至少为 5。min(..., ...)：对单次输入的长度做硬性限制。减去 2000 是为了留出足够的空间让模型生成回复，防止 Prompt 占满最大上下文。
                 prompt_tokens = min(df_models[df_models['model_id']==model_id]['max_context'].values[0] - 2000, max(5, prompt_tokens))
-                completion_tokens = max(1, min(8000, completion_tokens))
+                # max(1, ...)：确保输出 Token 至少为 1。min(8192, ...)：对单次回复的长度做硬性限制。
+                completion_tokens = max(1, min(8192, completion_tokens))
 
                 # Latency 基础模拟: 与 Token 数正相关，外加基础延迟
                 base_latency = 300 + completion_tokens * 15 # 每生成一个 Token 约需 15ms

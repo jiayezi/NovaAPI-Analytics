@@ -37,11 +37,42 @@ def extract_from_mysql(engine):
     logger.info("正在从 MySQL 业务库中抽取全量数据...")
     df_users = pd.read_sql("SELECT * FROM users", engine)
     df_models = pd.read_sql("SELECT * FROM ai_models", engine)
-    df_api_keys = pd.read_sql("SELECT key_id, user_id FROM api_keys", engine)
+    df_api_keys = pd.read_sql("SELECT key_id, user_id, key_name, is_active FROM api_keys", engine)
     # 对于实际大数据量项目，这里会使用增量抽取。由于我们目前记录不多(10~20万)，全量抽取秒回
     df_logs = pd.read_sql("SELECT * FROM request_logs_raw", engine)
     df_billing = pd.read_sql("SELECT * FROM billing_orders", engine)
     return df_users, df_models, df_api_keys, df_logs, df_billing
+
+def validate_and_clean(df_logs, df_billing):
+    """
+    Data Quality (DQ) 环节：对原始数据进行清洗和约束校验
+    """
+    dq_stats = {"original_logs": len(df_logs), "original_billing": len(df_billing)}
+    
+    # 1. 日志去重 (防止重试导致的重复记录)
+    df_logs = df_logs.drop_duplicates(subset=['request_id'], keep='first')
+    dq_stats["deduplicated_logs"] = dq_stats["original_logs"] - len(df_logs)
+
+    # 2. 负值纠正：Token 和 Latency 不能为负
+    # 将负值重置为 0 或剔除，这里我们选择剔除明显异常的脏数据
+    valid_mask = (df_logs['prompt_token_count'] >= 0) & \
+                 (df_logs['completion_token_count'] >= 0) & \
+                 (df_logs['latency_ms'] > 0)
+    df_logs = df_logs[valid_mask]
+    dq_stats["invalid_numeric_logs"] = dq_stats["original_logs"] - dq_stats["deduplicated_logs"] - len(df_logs)
+
+    # 3. 空值填充：将 error_code 为空的统一标记为 'NONE'
+    df_logs['error_code'] = df_logs['error_code'].fillna('NONE')
+
+    # 4. 财务流水校验：Amount 不能为空
+    df_billing = df_billing.dropna(subset=['amount'])
+    dq_stats["invalid_billing"] = dq_stats["original_billing"] - len(df_billing)
+
+    logger.info(f"🛡️ Data Quality 检查完成: "
+                f"去重 {dq_stats['deduplicated_logs']} 条, "
+                f"过滤异常值 {dq_stats['invalid_numeric_logs']} 条.")
+    
+    return df_logs, df_billing
 
 def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billing):
     """在 DuckDB 内存中进行 Transform，并 Load 到星型架构事实表和维度表中"""
@@ -80,13 +111,21 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billi
     """)
     logger.info("🔧 维度表 [dim_status_code] 装载完成.")
 
-    # 4. 装载核心事务事实表: fct_api_requests
+    # 4. 挂载和装配维度表: dim_api_key
+    conn.execute("TRUNCATE TABLE dim_api_key")
+    conn.execute("""
+        INSERT INTO dim_api_key (key_id, key_name, is_active)
+        SELECT key_id, key_name, is_active FROM src_api_keys
+    """)
+    logger.info("🔧 维度表 [dim_api_key] 装载完成.")
+
+    # 5. 装载核心事务事实表: fct_api_requests
     # 这里我们利用 DuckDB 极速的 SQL 能力完成大表的维表转换关联和复杂业务计算 (计算价格)
     logger.info("⚙️ 正在转换和挂载业务指标事实表 [fct_api_requests]...")
     conn.execute("TRUNCATE TABLE fct_api_requests")
     conn.execute("""
         INSERT INTO fct_api_requests (
-            request_id, account_sk, model_sk, status_sk, 
+            request_id, account_sk, model_sk, status_sk, key_sk,
             request_time, latency_ms, 
             prompt_tokens, completion_tokens, cost_usd
         )
@@ -95,6 +134,7 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billi
             a.account_sk,
             m.model_sk,
             s.status_sk,
+            k_dim.key_sk,
             l.request_time,
             l.latency_ms,
             l.prompt_token_count,
@@ -103,10 +143,11 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billi
             (l.prompt_token_count * m.input_price_per_1M / 1000000.0) + 
             (l.completion_token_count * m.output_price_per_1M / 1000000.0) AS cost_usd
         FROM src_logs l
-        -- 关联获得 user_id
-        JOIN src_api_keys k ON l.key_id = k.key_id
+        -- 关联获得 user_id 及 Key 信息
+        JOIN src_api_keys k_src ON l.key_id = k_src.key_id
         -- 找到代理键 (Surrogate Keys)
-        JOIN dim_account a ON k.user_id = a.user_id AND a.is_current = TRUE
+        JOIN dim_account a ON k_src.user_id = a.user_id AND a.is_current = TRUE
+        JOIN dim_api_key k_dim ON l.key_id = k_dim.key_id
         JOIN dim_model m ON l.model_id = m.model_id
         JOIN dim_status_code s 
           ON l.http_status = s.http_status 
@@ -166,10 +207,13 @@ def run_etl():
         # ODS/DWD 初始化
         init_dw_schema(duckdb_conn)
         
-        # 抽取
-        df_users, df_models, df_api_keys, df_logs, df_billing = extract_from_mysql(mysql_engine)
+        # 抽取 (Extract)
+        df_users, df_models, df_api_keys, df_logs_raw, df_billing_raw = extract_from_mysql(mysql_engine)
         
-        # 转换并装载
+        # 清洗与校验 (Validate & Clean)
+        df_logs, df_billing = validate_and_clean(df_logs_raw, df_billing_raw)
+
+        # 转换并装载 (Transform & Load)
         transform_and_load(duckdb_conn, df_users, df_models, df_api_keys, df_logs, df_billing)
         
         duckdb_conn.close()

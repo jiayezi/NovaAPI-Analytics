@@ -33,6 +33,14 @@ CREATE TABLE IF NOT EXISTS dim_status_code (
     is_error BOOLEAN
 );
 
+CREATE SEQUENCE IF NOT EXISTS seq_key_sk START 1;
+CREATE TABLE IF NOT EXISTS dim_api_key (
+    key_sk INTEGER PRIMARY KEY DEFAULT nextval('seq_key_sk'),
+    key_id INTEGER,
+    key_name VARCHAR,
+    is_active BOOLEAN
+);
+
 
 -- ==========================================
 -- 2. 事实表 (Fact Tables)
@@ -44,6 +52,7 @@ CREATE TABLE IF NOT EXISTS fct_api_requests (
     account_sk INTEGER,
     model_sk INTEGER,
     status_sk INTEGER,
+    key_sk INTEGER,
     request_time TIMESTAMP,
     latency_ms INTEGER,
     prompt_tokens INTEGER,
