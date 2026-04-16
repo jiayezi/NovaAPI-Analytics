@@ -80,3 +80,68 @@ CREATE TABLE IF NOT EXISTS fct_account_daily_snapshot (
     daily_cost_usd DOUBLE,
     PRIMARY KEY (snapshot_date, account_sk)
 );
+
+-- ==========================================
+-- 3. 汇总层 (DWS - 指标中心化模型)
+-- 核心原则：新增指标 = 新行，而不是新表或新列
+-- ==========================================
+
+-- 3.1 指标元数据注册表 (所有指标的口径定义)
+CREATE TABLE IF NOT EXISTS meta_metric (
+    metric_code VARCHAR PRIMARY KEY,  -- 'account.monthly.cost', 'model.daily.latency_p99'
+    metric_name VARCHAR,              -- 中文名：'账户月度 API 成本'
+    description VARCHAR,              -- 业务含义说明
+    formula VARCHAR,                  -- 计算口径：'SUM(cost_usd) GROUP BY account, month'
+    entity_type VARCHAR,              -- 主体类型：'account' / 'model' / 'platform'
+    time_type VARCHAR,                -- 时间粒度：'day' / 'month' / 'year'
+    status VARCHAR DEFAULT 'online'   -- 'draft' / 'online' / 'deprecated'
+);
+
+-- 3.2 通用指标数值表 (统一存储所有数值型汇总指标)
+CREATE TABLE IF NOT EXISTS dws_metric_value (
+    metric_code VARCHAR,    -- 关联 meta_metric
+    entity_type VARCHAR,    -- 'account' / 'model' / 'platform'
+    entity_id VARCHAR,      -- 主体 ID (account_sk 或 model_sk 的字符串形式)
+    time_type VARCHAR,      -- 'day' / 'month' / 'year'
+    time_id VARCHAR,        -- 时间标识：'2026-04', '2026-04-15', '2026'
+    metric_value DOUBLE,
+    created_at TIMESTAMP DEFAULT current_timestamp,
+    PRIMARY KEY (metric_code, entity_type, entity_id, time_type, time_id)
+);
+
+-- 3.3 指标结构化结果表 (存储无法用单一数值表达的复合结果)
+CREATE TABLE IF NOT EXISTS dws_metric_struct (
+    metric_code VARCHAR,
+    entity_type VARCHAR,
+    entity_id VARCHAR,
+    time_type VARCHAR,
+    time_id VARCHAR,
+    struct_type VARCHAR,    -- 'rank' / 'distribution' / 'segment' / 'forecast'
+    struct_json VARCHAR,    -- JSON 结构化结果
+    created_at TIMESTAMP DEFAULT current_timestamp,
+    PRIMARY KEY (metric_code, entity_type, entity_id, time_type, time_id)
+);
+
+-- ==========================================
+-- 4. 应用层 (ADS - AI 分析结果标签池)
+-- ==========================================
+
+-- 4.1 通用账户标签池 (存储 AI 模型输出的用户级标签)
+CREATE TABLE IF NOT EXISTS ads_account_tags (
+    account_sk INTEGER,
+    tag_key VARCHAR,    -- 'segment_label', 'burn_rate', 'exhaust_date', 'churn_risk'
+    tag_value VARCHAR,
+    confidence DOUBLE,
+    updated_at TIMESTAMP,
+    PRIMARY KEY (account_sk, tag_key)
+);
+
+-- 4.2 通用模型标签池 (存储 AI 诊断的模型级标签)
+CREATE TABLE IF NOT EXISTS ads_model_tags (
+    model_sk INTEGER,
+    tag_key VARCHAR,    -- 'stability_rank', 'anomaly_score'
+    tag_value VARCHAR,
+    updated_at TIMESTAMP,
+    PRIMARY KEY (model_sk, tag_key)
+);
+

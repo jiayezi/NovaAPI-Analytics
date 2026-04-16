@@ -197,6 +197,132 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billi
     inserted_snapshots = conn.execute("SELECT COUNT(*) FROM fct_account_daily_snapshot").fetchone()[0]
     logger.info(f"📈 快照事实表 [fct_account_daily_snapshot] 装载完成: 共 {inserted_snapshots} 行记录.")
 
+    # 8. 注册指标元数据 (meta_metric)
+    logger.info("⚙️ 正在注册指标元数据 [meta_metric]...")
+    conn.execute("DELETE FROM meta_metric WHERE status = 'online'")
+    metrics_meta = [
+        ("account.monthly.total_calls",   "账户月度调用次数", "COUNT(*) FROM fct_api_requests GROUP BY account, month",                   "account", "month"),
+        ("account.monthly.total_tokens",  "账户月度 Token 用量", "SUM(prompt_tokens + completion_tokens) GROUP BY account, month",          "account", "month"),
+        ("account.monthly.api_cost",      "账户月度 API 成本",  "SUM(cost_usd) FROM fct_api_requests GROUP BY account, month",              "account", "month"),
+        ("account.monthly.revenue",       "账户月度充值收入",   "SUM(amount) WHERE amount > 0 FROM fct_account_transactions",               "account", "month"),
+        ("account.monthly.net_profit",    "账户月度净利润",    "revenue - api_cost",                                                        "account", "month"),
+        ("platform.monthly.total_calls",  "平台月度总调用次数", "COUNT(*) FROM fct_api_requests GROUP BY month",                             "platform", "month"),
+        ("platform.monthly.total_revenue","平台月度总收入",    "SUM(amount) WHERE amount > 0 FROM fct_account_transactions GROUP BY month", "platform", "month"),
+        ("platform.monthly.net_profit",   "平台月度净利润",    "total_revenue - total_cost",                                                "platform", "month"),
+    ]
+    for code, name, formula, etype, ttype in metrics_meta:
+        conn.execute("""
+            INSERT OR REPLACE INTO meta_metric (metric_code, metric_name, description, formula, entity_type, time_type, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'online')
+        """, [code, name, name, formula, etype, ttype])
+    logger.info(f"📋 指标元数据注册完成: 共 {len(metrics_meta)} 个指标.")
+
+    # 9. 生成 DWS 指标数值 (dws_metric_value) —— 指标中心化模型
+    logger.info("⚙️ 正在计算并写入 DWS 汇总指标 [dws_metric_value]...")
+    conn.execute("TRUNCATE TABLE dws_metric_value")
+
+    # 9.1 账户级月度指标 (5 个指标一次性计算)
+    conn.execute("""
+        WITH monthly_costs AS (
+            SELECT 
+                strftime('%Y-%m', request_time) as month_id,
+                account_sk,
+                COUNT(*) as calls,
+                SUM(prompt_tokens + completion_tokens) as tokens,
+                SUM(cost_usd) as cost
+            FROM fct_api_requests
+            GROUP BY 1, 2
+        ),
+        monthly_revenue AS (
+            SELECT 
+                strftime('%Y-%m', created_at) as month_id,
+                account_sk,
+                SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as revenue
+            FROM fct_account_transactions
+            WHERE transaction_status = 'completed'
+            GROUP BY 1, 2
+        ),
+        combined AS (
+            SELECT 
+                COALESCE(c.month_id, r.month_id) as month_id,
+                COALESCE(c.account_sk, r.account_sk) as account_sk,
+                COALESCE(c.calls, 0) as total_calls,
+                COALESCE(c.tokens, 0) as total_tokens,
+                COALESCE(c.cost, 0) as total_cost,
+                COALESCE(r.revenue, 0) as total_revenue
+            FROM monthly_costs c
+            FULL OUTER JOIN monthly_revenue r 
+              ON c.month_id = r.month_id AND c.account_sk = r.account_sk
+        )
+        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
+        SELECT metric_code, 'account', CAST(account_sk AS VARCHAR), 'month', month_id, val
+        FROM combined
+        UNPIVOT (
+            val FOR metric_code IN (
+                total_calls AS 'account.monthly.total_calls',
+                total_tokens AS 'account.monthly.total_tokens',
+                total_cost AS 'account.monthly.api_cost',
+                total_revenue AS 'account.monthly.revenue'
+            )
+        )
+    """)
+
+    # 9.2 账户级净利润 (revenue - cost，需要单独计算)
+    conn.execute("""
+        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
+        WITH profit AS (
+            SELECT 
+                COALESCE(c.month_id, r.month_id) as month_id,
+                COALESCE(c.account_sk, r.account_sk) as account_sk,
+                COALESCE(r.revenue, 0) - COALESCE(c.cost, 0) as net_profit
+            FROM (
+                SELECT strftime('%Y-%m', request_time) as month_id, account_sk, SUM(cost_usd) as cost
+                FROM fct_api_requests GROUP BY 1, 2
+            ) c
+            FULL OUTER JOIN (
+                SELECT strftime('%Y-%m', created_at) as month_id, account_sk,
+                       SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as revenue
+                FROM fct_account_transactions WHERE transaction_status = 'completed' GROUP BY 1, 2
+            ) r ON c.month_id = r.month_id AND c.account_sk = r.account_sk
+        )
+        SELECT 'account.monthly.net_profit', 'account', CAST(account_sk AS VARCHAR), 'month', month_id, net_profit
+        FROM profit
+    """)
+
+    # 9.3 平台级月度汇总指标
+    conn.execute("""
+        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
+        SELECT 'platform.monthly.total_calls', 'platform', 'ALL', 'month',
+               strftime('%Y-%m', request_time), COUNT(*)
+        FROM fct_api_requests GROUP BY 5
+    """)
+    conn.execute("""
+        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
+        SELECT 'platform.monthly.total_revenue', 'platform', 'ALL', 'month',
+               strftime('%Y-%m', created_at), SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END)
+        FROM fct_account_transactions WHERE transaction_status = 'completed' GROUP BY 5
+    """)
+    conn.execute("""
+        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
+        WITH platform_profit AS (
+            SELECT 
+                COALESCE(c.m, r.m) as month_id,
+                COALESCE(r.rev, 0) - COALESCE(c.cost, 0) as profit
+            FROM (SELECT strftime('%Y-%m', request_time) as m, SUM(cost_usd) as cost FROM fct_api_requests GROUP BY 1) c
+            FULL OUTER JOIN (
+                SELECT strftime('%Y-%m', created_at) as m,
+                       SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as rev
+                FROM fct_account_transactions WHERE transaction_status = 'completed' GROUP BY 1
+            ) r ON c.m = r.m
+        )
+        SELECT 'platform.monthly.net_profit', 'platform', 'ALL', 'month', month_id, profit
+        FROM platform_profit
+    """)
+
+    inserted_dws = conn.execute("SELECT COUNT(*) FROM dws_metric_value").fetchone()[0]
+    distinct_metrics = conn.execute("SELECT COUNT(DISTINCT metric_code) FROM dws_metric_value").fetchone()[0]
+    logger.info(f"📈 DWS 指标数值表 [dws_metric_value] 写入完成: 共 {inserted_dws} 行, 覆盖 {distinct_metrics} 个指标.")
+
 def run_etl():
     logger.info("=== 🚀 开始执行 ETL 批处理流水线 ===")
     
