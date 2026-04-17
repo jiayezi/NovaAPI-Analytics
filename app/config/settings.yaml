@@ -74,6 +74,6 @@ ai_models:
 
 # 数据生成器配置
 generator:
-  initial_users: 50
+  initial_users: 69
   max_keys_per_user: 3
-  simulation_days: 30
+  simulation_days: 90

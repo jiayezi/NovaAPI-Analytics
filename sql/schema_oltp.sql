@@ -16,6 +16,17 @@ CREATE TABLE IF NOT EXISTS `users` (
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB COMMENT='用户基础信息表';
 
+-- 1.5 用户订阅计划变更流水表 (User Plan Changes Log) - 用于 CDC 或 SCD2 练习
+CREATE TABLE IF NOT EXISTS `user_plan_changes` (
+    `change_id` INT AUTO_INCREMENT PRIMARY KEY,
+    `user_id` INT NOT NULL,
+    `old_plan` VARCHAR(20) NOT NULL COMMENT '变更前的订阅级别',
+    `new_plan` VARCHAR(20) NOT NULL COMMENT '变更后的订阅级别',
+    `change_date` DATETIME NOT NULL COMMENT '变更时间',
+    `change_reason` VARCHAR(100) DEFAULT 'user_upgrade' COMMENT '变更原因',
+    FOREIGN KEY (`user_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
+) ENGINE=InnoDB COMMENT='用户订阅级别变更轨迹表';
+
 -- 2. API 密钥表 (API Keys)
 CREATE TABLE IF NOT EXISTS `api_keys` (
     `key_id` INT AUTO_INCREMENT PRIMARY KEY COMMENT '密钥主键',

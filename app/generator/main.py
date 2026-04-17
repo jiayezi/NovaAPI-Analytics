@@ -41,44 +41,71 @@ def generate_reference_data():
 
 def generate_users_and_keys(num_users, max_keys):
     """根据幂律分布和偏好生成用户极其具有代表性的属性"""
-    logger.info(f"正在生成 {num_users} 个基础用户和 API Keys...")
+    logger.info(f"正在生成 {num_users} 个基础用户和 API Keys (包含用户升级演变以支持 SCD2)...")
     users = []
     api_keys = []
+    plan_changes = []
     
     # 用户订阅分布： 70% Free, 25% Pro, 5% Enterprise
     tiers = np.random.choice(['free', 'pro', 'enterprise'], size=num_users, p=[0.70, 0.25, 0.05])
     
-    # 基准起始时间 (30天前的 0点)
+    # 基准起始时间
     base_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=settings.generator.simulation_days)
 
+    change_id_counter = 1
+
     for i, tier in enumerate(tiers):
+        reg_date = base_start - timedelta(days=random.randint(1, 45), hours=random.randint(0, 23))
+        user_id = i+1
+        initial_plan = tier
+        upgrade_date = None
+        current_plan = tier
+        balance = 0
+
+        # 模拟 SCD2 升级：如果是 Pro 或 Enterprise，有0.4的概率是中途升级上来的，有0.6的概率是一开始就是该等级
+        if tier in ['pro', 'enterprise'] and random.random() < 0.4:
+            initial_plan = 'free' if tier == 'pro' else random.choice(['free', 'pro'])
+            # 随机在基准起始时间到现在的某一天升级
+            upgrade_offset = random.randint(5, max(10, settings.generator.simulation_days - 10))
+            upgrade_date = base_start + timedelta(days=upgrade_offset, hours=random.randint(9, 18))
+            
+            plan_changes.append({
+                'change_id': change_id_counter,
+                'user_id': user_id,
+                'old_plan': initial_plan,
+                'new_plan': current_plan,
+                'change_date': upgrade_date,
+                'change_reason': 'user_upgrade'
+            })
+            change_id_counter += 1
         
-        # 模拟不同级别的初始资金
-        if tier == 'enterprise':
+        # 模拟不同级别的最终资金 (根据最终状态)
+        if current_plan == 'enterprise':
             balance = np.random.uniform(100, 1000)
-        elif tier == 'pro':
+        elif current_plan == 'pro':
             balance = np.random.uniform(20, 100)
         else:
             balance = np.random.uniform(0, 10)
             
-        reg_date = base_start - timedelta(days=random.randint(1, 30), hours=random.randint(0, 23))
-            
         users.append({
-            'user_id': i,
+            'user_id': user_id,
             'email': fake.unique.email(),
             'password_hash': fake.sha256(),
             'registration_date': reg_date,
-            'subscription_plan': tier,
+            'subscription_plan': current_plan,
             'account_balance': round(balance, 4),
-            'status': 1
+            'status': 1,
+            # 辅助内部字段
+            '_initial_plan': initial_plan,
+            '_upgrade_date': upgrade_date
         })
         
         # Keys 
         num_k = random.randint(1, max_keys)
         for j in range(num_k):
             api_keys.append({
-                'key_id': j,
-                'user_id': i,
+                'key_id': len(api_keys) + 1,
+                'user_id': user_id,
                 'key_name': f"{tier.title()}-Key-{fake.word()}",
                 'api_key': "sk-nova-" + str(uuid.uuid4()),
                 'created_at': reg_date + timedelta(hours=random.randint(1, 10)),
@@ -87,7 +114,8 @@ def generate_users_and_keys(num_users, max_keys):
             
     df_users = pd.DataFrame(users)
     df_keys = pd.DataFrame(api_keys)
-    return df_users, df_keys
+    df_plan_changes = pd.DataFrame(plan_changes)
+    return df_users, df_keys, df_plan_changes
 
 
 def simulate_request_logs(df_keys, df_users, df_models, days=30):
@@ -123,6 +151,10 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
             user = df_users[df_users['user_id'] == key['user_id']].iloc[0]
             tier = user['subscription_plan']
             
+            # 动态支持 SCD2：如果用户有升级记录但数据模拟器生成当前请求日志时还没到升级日期，就使用初始的 Plan（升级前和升级后的请求数量和模型偏好是不同的）
+            if pd.notna(user.get('_upgrade_date')) and current_day < user['_upgrade_date']:
+                tier = user.get('_initial_plan', tier)
+                
             # 用户一天发多少请求？根据等级决定
             if tier == 'enterprise':
                 base_reqs = int(np.random.normal(500, 100)) # 企业用户日均 500 次
@@ -231,21 +263,21 @@ def simulate_billing_orders(df_users, days=30):
     order_id_counter = 1
     
     for index, user in df_users.iterrows():
-        tier = user['subscription_plan']
+        curr_plan = user['subscription_plan']
+        init_plan = user.get('_initial_plan', curr_plan)
+        upgrade_date = user.get('_upgrade_date')
         reg_date = user['registration_date']
         
+        def get_init_amount(p):
+            if p == 'enterprise': return np.random.uniform(500, 2000)
+            elif p == 'pro': return np.random.uniform(100, 300)
+            return np.random.uniform(5, 50)
+        
         # 初始充值
-        if tier == 'enterprise':
-            init_amount = np.random.uniform(500, 2000)
-        elif tier == 'pro':
-            init_amount = np.random.uniform(100, 300)
-        else:
-            init_amount = np.random.uniform(5, 50)
-            
         orders.append({
             'order_id': order_id_counter,
             'user_id': user['user_id'],
-            'amount': round(init_amount, 4),
+            'amount': round(get_init_amount(init_plan), 4),
             'order_type': 'recharge',
             'payment_method': random.choice(['credit_card', 'paypal', 'alipay']),
             'transaction_status': 'completed',
@@ -253,29 +285,75 @@ def simulate_billing_orders(df_users, days=30):
         })
         order_id_counter += 1
         
-        # 扣减订阅费 (针对 Pro/Enterprise)
-        if tier != 'free':
-            sub_fee = -50.0 if tier == 'pro' else -500.0
-            orders.append({
-                'order_id': order_id_counter,
-                'user_id': user['user_id'],
-                'amount': round(sub_fee, 4),
-                'order_type': 'subscription_fee',
-                'payment_method': 'credit_card',
-                'transaction_status': 'completed',
-                'created_at': reg_date + timedelta(hours=random.randint(1, 12))
-            })
-            order_id_counter += 1
+        # --- 订阅费逻辑 (含周期性续费) ---
+        def add_subscription_fees(plan, start_dt, end_dt):
+            nonlocal order_id_counter
+            if plan == 'free':
+                return
             
-        # 随机零星充值和用量结算扣费
-        current_time = reg_date + timedelta(days=random.randint(5, 10))
-        while current_time < datetime.now():
-            # 有时充值
-            if random.random() > 0.8:
+            sub_fee = -50.0 if plan == 'pro' else -500.0
+            billing_date = start_dt + timedelta(hours=random.randint(1, 12))
+            
+            while billing_date < end_dt and billing_date < datetime.now():
                 orders.append({
                     'order_id': order_id_counter,
                     'user_id': user['user_id'],
-                    'amount': round(np.random.uniform(20, 100), 4),
+                    'amount': round(sub_fee, 4),
+                    'order_type': 'subscription_fee',
+                    'payment_method': 'credit_card' if random.random() > 0.3 else 'balance',
+                    'transaction_status': 'completed',
+                    'created_at': billing_date
+                })
+                order_id_counter += 1
+                billing_date += timedelta(days=30) # 每 30 天续费一次
+
+        # 处理初始阶段到升级前 (或到现在) 的订阅费
+        # 如果有中途升级记录，则账单生成到升级日期结束（下一步会处理升级后的账单），否则则账单生成到当前时间
+        sub_end_limit = upgrade_date if pd.notna(upgrade_date) else datetime.now()
+        add_subscription_fees(init_plan, reg_date, sub_end_limit)
+            
+        # 模拟 SCD2 中途升级导致的充值与扣费
+        if pd.notna(upgrade_date):
+            # 升级时的充值
+            orders.append({
+                'order_id': order_id_counter,
+                'user_id': user['user_id'],
+                'amount': round(get_init_amount(curr_plan), 4),
+                'order_type': 'recharge',
+                'payment_method': 'credit_card',
+                'transaction_status': 'completed',
+                'created_at': upgrade_date - timedelta(minutes=random.randint(5, 30))
+            })
+            order_id_counter += 1
+            
+            # 升级后的周期性订阅费（账单从升级日期开始，每 30 天续费一次）
+            add_subscription_fees(curr_plan, upgrade_date, datetime.now())
+            
+        # 随机零星充值和用量结算扣费 (梯度化模拟)
+        current_time = reg_date + timedelta(days=random.randint(5, 10))
+        while current_time < datetime.now():
+            # 动态获取当前时刻的等级
+            acting_tier = init_plan
+            if pd.notna(upgrade_date) and current_time >= upgrade_date:
+                acting_tier = curr_plan
+
+            # 根据等级设定金额步长
+            if acting_tier == 'enterprise':
+                recharge_range = (500, 2000)
+                usage_range = (100, 500)
+            elif acting_tier == 'pro':
+                recharge_range = (50, 200)
+                usage_range = (10, 50)
+            else:
+                recharge_range = (10, 30)
+                usage_range = (0.5, 5)
+
+            # 有时充值 (当余额可能不足时概率更高，这里简单模拟，大约20天充值一次)
+            if random.random() > 0.95:
+                orders.append({
+                    'order_id': order_id_counter,
+                    'user_id': user['user_id'],
+                    'amount': round(np.random.uniform(*recharge_range), 4),
                     'order_type': 'recharge',
                     'payment_method': 'credit_card',
                     'transaction_status': 'completed',
@@ -283,19 +361,20 @@ def simulate_billing_orders(df_users, days=30):
                 })
                 order_id_counter += 1
                 
-            # 周期性扣费
+            # 周期性结算
             orders.append({
                 'order_id': order_id_counter,
                 'user_id': user['user_id'],
-                'amount': -round(np.random.uniform(1, 15), 4),
+                'amount': -round(np.random.uniform(*usage_range), 4),
                 'order_type': 'usage_settlement',
                 'payment_method': 'balance',
                 'transaction_status': 'completed',
                 'created_at': current_time + timedelta(hours=random.randint(1, 4))
             })
             order_id_counter += 1
-            # 步进几天
-            current_time += timedelta(days=random.randint(3, 7))
+            
+            # 步进几天（结算一般是阈值驱动：例如，用户的欠费或消费达到了 $50，系统立即触发一次 balance 结算（这时，时间就是不固定的）。）
+            current_time += timedelta(days=random.randint(4, 10))
             
     df_orders = pd.DataFrame(orders)
     if not df_orders.empty:
@@ -305,7 +384,7 @@ def simulate_billing_orders(df_users, days=30):
     return df_orders
 
 
-def export_or_insert_to_db(df_users, df_keys, df_models, df_logs, df_billing):
+def export_or_insert_to_db(df_users, df_keys, df_plan_changes, df_models, df_logs, df_billing):
     """将数据保存至 MySQL 数据库"""
     try:
         engine = get_engine()
@@ -323,11 +402,16 @@ def export_or_insert_to_db(df_users, df_keys, df_models, df_logs, df_billing):
             conn.execute(text("TRUNCATE TABLE request_logs_raw;"))
             conn.execute(text("TRUNCATE TABLE ai_models;"))
             conn.execute(text("TRUNCATE TABLE api_keys;"))
+            conn.execute(text("TRUNCATE TABLE user_plan_changes;"))
             conn.execute(text("TRUNCATE TABLE users;"))
             conn.execute(text("SET FOREIGN_KEY_CHECKS = 1;"))
             
         df_users.to_sql('users', con=engine, if_exists='append', index=False)
         logger.info(f"✅ Users 导入成功: {len(df_users)} 行")
+        
+        if not df_plan_changes.empty:
+            df_plan_changes.to_sql('user_plan_changes', con=engine, if_exists='append', index=False)
+            logger.info(f"✅ User Plan Changes 导入成功: {len(df_plan_changes)} 行")
         
         df_keys.to_sql('api_keys', con=engine, if_exists='append', index=False)
         logger.info(f"✅ API Keys 导入成功: {len(df_keys)} 行")
@@ -353,6 +437,8 @@ def export_or_insert_to_db(df_users, df_keys, df_models, df_logs, df_billing):
         os.makedirs(data_dir, exist_ok=True)
         
         df_users.to_csv(os.path.join(data_dir, "users.csv"), index=False)
+        if not df_plan_changes.empty:
+            df_plan_changes.to_csv(os.path.join(data_dir, "user_plan_changes.csv"), index=False)
         df_keys.to_csv(os.path.join(data_dir, "api_keys.csv"), index=False)
         df_models.to_csv(os.path.join(data_dir, "ai_models.csv"), index=False)
         df_billing.to_csv(os.path.join(data_dir, "billing_orders.csv"), index=False)
@@ -368,14 +454,17 @@ def main():
     days = settings.generator.simulation_days
     
     df_models = generate_reference_data()
-    df_users, df_keys = generate_users_and_keys(num_users=num_users, max_keys=max_keys)
+    df_users, df_keys, df_plan_changes = generate_users_and_keys(num_users=num_users, max_keys=max_keys)
     df_billing = simulate_billing_orders(df_users, days=days)
     df_logs = simulate_request_logs(df_keys, df_users, df_models, days=days)
+    
+    # 清理内部辅助字段
+    df_users_clean = df_users.drop(columns=['_initial_plan', '_upgrade_date'])
     
     logger.info(f"🏁 测算完成！共计 {len(df_logs)} 条调用请求流日志.")
     
     # 导进数据库或生成CSV
-    export_or_insert_to_db(df_users, df_keys, df_models, df_logs, df_billing)
+    export_or_insert_to_db(df_users_clean, df_keys, df_plan_changes, df_models, df_logs, df_billing)
     logger.info("=== 全部流程生成结束 ===")
 
 if __name__ == "__main__":
