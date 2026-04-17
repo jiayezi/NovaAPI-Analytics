@@ -329,7 +329,8 @@ def simulate_billing_orders(df_users, days=30):
             # 升级后的周期性订阅费（账单从升级日期开始，每 30 天续费一次）
             add_subscription_fees(curr_plan, upgrade_date, datetime.now())
             
-        # 随机零星充值和用量结算扣费 (梯度化模拟)
+        # 随机零星充值和用量结算扣费 (使用时间锚点确保频率准确)
+        last_recharge_date = reg_date
         current_time = reg_date + timedelta(days=random.randint(5, 10))
         while current_time < datetime.now():
             # 动态获取当前时刻的等级
@@ -337,19 +338,22 @@ def simulate_billing_orders(df_users, days=30):
             if pd.notna(upgrade_date) and current_time >= upgrade_date:
                 acting_tier = curr_plan
 
-            # 根据等级设定金额步长
+            # 根据等级设定金额范围与目标充值周期
             if acting_tier == 'enterprise':
                 recharge_range = (500, 2000)
                 usage_range = (100, 500)
+                target_interval = 30
             elif acting_tier == 'pro':
                 recharge_range = (50, 200)
                 usage_range = (10, 50)
+                target_interval = 30
             else:
                 recharge_range = (10, 30)
                 usage_range = (0.5, 5)
+                target_interval = 10
 
-            # 有时充值 (当余额可能不足时概率更高，这里简单模拟，大约20天充值一次)
-            if random.random() > 0.95:
+            # 检查是否由于时间达标需要充值 (允许 ±2 天抖动)
+            if (current_time - last_recharge_date).days >= (target_interval + random.randint(-2, 2)):
                 orders.append({
                     'order_id': order_id_counter,
                     'user_id': user['user_id'],
@@ -360,8 +364,10 @@ def simulate_billing_orders(df_users, days=30):
                     'created_at': current_time
                 })
                 order_id_counter += 1
+                last_recharge_date = current_time
                 
             # 周期性结算
+            # 混合计费制 (Hybrid Model - 订阅费 + 额外用量)
             orders.append({
                 'order_id': order_id_counter,
                 'user_id': user['user_id'],
@@ -369,11 +375,12 @@ def simulate_billing_orders(df_users, days=30):
                 'order_type': 'usage_settlement',
                 'payment_method': 'balance',
                 'transaction_status': 'completed',
-                'created_at': current_time + timedelta(hours=random.randint(1, 4))
+                'created_at': current_time + timedelta(hours=random.randint(1, 12))
             })
             order_id_counter += 1
             
-            # 步进几天（结算一般是阈值驱动：例如，用户的欠费或消费达到了 $50，系统立即触发一次 balance 结算（这时，时间就是不固定的）。）
+            # 步进几天
+            # 结算一般是阈值驱动：例如，用户的欠费或消费达到了 $50，系统立即触发一次 balance 结算（这时，时间就是不固定的）。
             current_time += timedelta(days=random.randint(4, 10))
             
     df_orders = pd.DataFrame(orders)
