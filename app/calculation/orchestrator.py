@@ -37,19 +37,22 @@ class AnalyticsOrchestrator:
             metadata=metadata or {}
         )
 
-    def run_all(self):
-        """执行全量指标计算"""
-        logger.info(f"🚀 开始执行全量指标计算任务: {self.start_date.date()} -> {self.end_date.date()}")
+    def run_all(self, time_grain: Optional[str] = None):
+        """
+        执行指标计算任务
+        :param time_grain: 可选，按时间粒度过滤 (daily/monthly/weekly)，如果不传则执行全量。
+        """
+        logger.info(f"🚀 开始执行指标计算任务: {self.start_date.date()} -> {self.end_date.date()} (频率: {time_grain or 'ALL'})")
         
         # 按 CalculationStage 的定义顺序依次执行
         for stage in CalculationStage:
-            self._run_stage(stage)
+            self._run_stage(stage, time_grain=time_grain)
         
         logger.info("🏁 所有指标计算任务执行完毕。")
 
-    def _run_stage(self, stage: CalculationStage):
+    def _run_stage(self, stage: CalculationStage, time_grain: Optional[str] = None):
         """运行特定阶段的所有计算器"""
-        calculators = MetricRegistry.get_by_stage(stage)
+        calculators = MetricRegistry.get_by_stage(stage, time_grain=time_grain)
         if not calculators:
             return
 
@@ -77,7 +80,7 @@ class AnalyticsOrchestrator:
                     # [模式 A] Python+Pandas 计算逻辑
                     df_result = calc.calculate(self.ctx)
                     
-                    # 3. 结果入库 (ADS 层)
+                    # 3. 结果入库 (DWS / ADS)
                     if df_result is not None and not df_result.empty:
                         if not calc.validate_result(df_result):
                             logger.error(f"严重错误: 指标 [{calc.metric_code}] 返回的数据格式不合法!")
@@ -92,3 +95,4 @@ class AnalyticsOrchestrator:
                 logger.error(f"❌ 指标 [{calc.metric_code}] 计算失败: {str(e)}", exc_info=True)
                 # 在生产环境下可以选择跳过或停止全部任务
                 continue
+            

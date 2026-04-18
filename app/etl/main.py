@@ -102,7 +102,7 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_plan_changes, 
         INSERT INTO dim_account (user_id, email, subscription_plan, registration_date, valid_from, valid_to, is_current)
         WITH all_events AS (
             -- 1. 获取所有状态开启的时间点
-            -- 注册时的初始状态
+            -- 查询注册时的初始订阅状态
             SELECT 
                 u.user_id, u.email, u.registration_date::TIMESTAMP as registration_date, -- 强制转换为微秒（DuckDB 与 Pandas 之间时间戳精度不一致）
                 COALESCE(first_c.old_plan, u.subscription_plan) as plan,
@@ -114,7 +114,7 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_plan_changes, 
                 FROM src_plan_changes
             ) first_c ON u.user_id = first_c.user_id AND first_c.rn = 1
             UNION ALL
-            -- 历次变更后的新状态
+            -- 查询历次变更后的新订阅状态
             SELECT 
                 u.user_id, u.email, u.registration_date::TIMESTAMP as registration_date,
                 new_plan as plan,

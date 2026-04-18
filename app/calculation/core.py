@@ -45,10 +45,15 @@ class MetricRegistry:
         return decorator
 
     @classmethod
-    def get_by_stage(cls, stage: CalculationStage) -> List['BaseMetricCalculator']:
-        """获取指定阶段的所有计算器实例，并按优先级排序"""
+    def get_by_stage(cls, stage: CalculationStage, time_grain: Optional[str] = None) -> List['BaseMetricCalculator']:
+        """获取指定阶段的所有计算器实例，并按优先级和时间粒度排序/过滤"""
         classes = cls._calculators.get(stage, [])
         instances = [c() for c in classes]
+        
+        # 按时间粒度进行过滤 (daily/monthly/weekly)
+        if time_grain:
+            instances = [c for c in instances if getattr(c, 'time_grain', 'daily') == time_grain]
+            
         return sorted(instances, key=lambda x: getattr(x, "priority", 0))
 
 # 4. 指标计算器基类 (所有具体指标必须继承此基类)
@@ -57,6 +62,7 @@ class BaseMetricCalculator(ABC):
     entity_type: str = ""        # 实体类型 (user, model, platform)
     storage_table: str = ""      # 目标存储表 (ADS 层)
     description: str = "指标计算"  # 用于进度显示的名称
+    time_grain: str = "daily"    # 时间粒度 (daily, monthly, weekly, yearly)，用于声明自己“多久计算一次”
     is_sql_mode: bool = False    # 是否开启 SQL 快速结算模式 (直接在 DB 执行 INSERT SELECT)
     priority: int = 0            # 执行优先级 (越小越先执行)
 
@@ -84,15 +90,15 @@ class BaseMetricCalculator(ABC):
             return "", ()
         
         # 默认基于日期范围和指标编码清理数据 (Delete-Before-Insert 模式)
-        sql = f"DELETE FROM {self.storage_table} WHERE metric_code = %s AND time_id BETWEEN %s AND %s"
-        params = (self.metric_code, ctx.start_date.strftime('%Y%m%d'), ctx.end_date.strftime('%Y%m%d'))
+        sql = f"DELETE FROM {self.storage_table} WHERE metric_code = ? AND time_id BETWEEN ? AND ?"
+        params = (self.metric_code, ctx.start_date.strftime('%Y-%m-%d'), ctx.end_date.strftime('%Y-%m-%d'))
         
         # 如果是用户或模型维度，可以进一步缩小删除范围
         if self.entity_type == 'user' and ctx.user_ids:
-            sql += f" AND entity_id IN ({','.join(['%s']*len(ctx.user_ids))})"
+            sql += f" AND entity_id IN ({','.join(['?']*len(ctx.user_ids))})"
             params += tuple(ctx.user_ids)
         elif self.entity_type == 'model' and ctx.model_ids:
-            sql += f" AND entity_id IN ({','.join(['%s']*len(ctx.model_ids))})"
+            sql += f" AND entity_id IN ({','.join(['?']*len(ctx.model_ids))})"
             params += tuple(ctx.model_ids)
 
         return sql, params
