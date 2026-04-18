@@ -55,7 +55,10 @@ def generate_users_and_keys(num_users, max_keys):
     change_id_counter = 1
 
     for i, tier in enumerate(tiers):
-        reg_date = base_start - timedelta(days=random.randint(1, 45), hours=random.randint(0, 23))
+        # 随机注册时间在基准起始时间到现在的范围内 (以便分析新增长用户趋势)
+        time_span = (datetime.now() - base_start).total_seconds()
+        reg_seconds = random.uniform(0, time_span)
+        reg_date = base_start + timedelta(seconds=int(reg_seconds))
         user_id = i+1
         initial_plan = tier
         upgrade_date = None
@@ -64,20 +67,24 @@ def generate_users_and_keys(num_users, max_keys):
 
         # 模拟 SCD2 升级：如果是 Pro 或 Enterprise，有0.4的概率是中途升级上来的，有0.6的概率是一开始就是该等级
         if tier in ['pro', 'enterprise'] and random.random() < 0.4:
-            initial_plan = 'free' if tier == 'pro' else random.choice(['free', 'pro'])
-            # 随机在基准起始时间到现在的某一天升级
-            upgrade_offset = random.randint(5, max(10, settings.generator.simulation_days - 10))
-            upgrade_date = base_start + timedelta(days=upgrade_offset, hours=random.randint(9, 18))
+            # 模拟 SCD2 升级：尝试在注册之后安排一个升级时间
+            # 我们确保升级时间在注册日之后，且在当前时间之前
+            time_window = (datetime.now() - reg_date).total_seconds()
+            if time_window > 86400 * 3: # 如果注册时间到现在超过3天，才模拟中途升级
+                initial_plan = 'free' if tier == 'pro' else random.choice(['free', 'pro'])
+                # 升级发生在注册 1 天后到当前时间的 80% 处
+                upgrade_delay = random.uniform(86400, time_window * 0.8)
+                upgrade_date = reg_date + timedelta(seconds=int(upgrade_delay))
             
-            plan_changes.append({
-                'change_id': change_id_counter,
-                'user_id': user_id,
-                'old_plan': initial_plan,
-                'new_plan': current_plan,
-                'change_date': upgrade_date,
-                'change_reason': 'user_upgrade'
-            })
-            change_id_counter += 1
+                plan_changes.append({
+                    'change_id': change_id_counter,
+                    'user_id': user_id,
+                    'old_plan': initial_plan,
+                    'new_plan': current_plan,
+                    'change_date': upgrade_date,
+                    'change_reason': 'user_upgrade'
+                })
+                change_id_counter += 1
         
         # 模拟不同级别的最终资金 (根据最终状态)
         if current_plan == 'enterprise':
@@ -108,7 +115,8 @@ def generate_users_and_keys(num_users, max_keys):
                 'user_id': user_id,
                 'key_name': f"{tier.title()}-Key-{fake.word()}",
                 'api_key': "sk-nova-" + str(uuid.uuid4()),
-                'created_at': reg_date + timedelta(hours=random.randint(1, 10)),
+                # Key 创建时间在注册之后，但不晚于现在
+                'created_at': min(reg_date + timedelta(hours=random.randint(1, 10)), datetime.now()),
                 'is_active': True
             })
             
@@ -137,9 +145,24 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
     expensive_models = df_models[df_models['output_price_per_1M'] > 12.0]['model_id'].tolist()
     
     # 挑选出“黑客用户”和“延迟异常模型”用于后续植入 AI 诊断案例
-    hacker_key_id = df_keys[df_keys['user_id'].isin(df_users[df_users['subscription_plan'] == 'free']['user_id'])].iloc[0]['key_id']
-    anomaly_model_id = "gpt-5.4" # 我们故意让 gpt-5.4 在第 15 天延迟翻倍
+    # 挑选出“黑客用户”和“延迟异常模型”用于后续植入 AI 诊断案例
+    # 警告：由于注册时间已改为随机，必须挑选在异常触发日之前已注册的用户
+    hacker_day = 20
     anomaly_day = 15
+    anomaly_model_id = "gpt-5.4" 
+
+    hacker_candidates = df_users[
+        (df_users['subscription_plan'] == 'free') & 
+        (df_users['registration_date'].dt.date <= (start_date + timedelta(days=hacker_day)).date())
+    ]
+    
+    if not hacker_candidates.empty:
+        # 挑选符合条件的第一个或随机一个免费用户
+        hacker_user_id = hacker_candidates.iloc[0]['user_id']
+        hacker_key_id = df_keys[df_keys['user_id'] == hacker_user_id].iloc[0]['key_id']
+    else:
+        hacker_key_id = None
+        logger.warning(f"⚠️ 未找到在第 {hacker_day} 天前注册的免费用户，黑客注入将跳过。")
 
     request_id_counter = 1
     
@@ -149,6 +172,11 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
         
         for index, key in df_keys.iterrows():
             user = df_users[df_users['user_id'] == key['user_id']].iloc[0]
+            
+            # 业务规则：API 调用时间不能早于密钥创建时间
+            if current_day.date() < key['created_at'].date(): # 必须按日期比较，因为 current_day 的时间固定是 00:00:00，而 key['created_at'] 通常会有时分秒（比如 14:30:00）
+                continue
+                
             tier = user['subscription_plan']
             
             # 动态支持 SCD2：如果用户有升级记录但数据模拟器生成当前请求日志时还没到升级日期，就使用初始的 Plan（升级前和升级后的请求数量和模型偏好是不同的）
@@ -167,10 +195,10 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
             if is_weekend:
                 base_reqs = int(base_reqs * 0.8)
                 
-            # 黑客异常埋点：在第20天，指定的免费用户盗刷十万级请求
-            if key['key_id'] == hacker_key_id and d == 20:
-                base_reqs += 5000 
-                logger.info(f"🚨 [异常注入]: 黑客 (User {key['user_id']}, Key {key['key_id']}) 在第 {d} 天发起海量刷单 ({base_reqs} requests).")
+            # 黑客异常埋点：在指定的异常天，指定的免费用户产生爆发式请求
+            if hacker_key_id and key['key_id'] == hacker_key_id and d == hacker_day:
+                base_reqs += 5000 # 爆发性增长
+                logger.info(f"🚨 [异常注入]: 黑客 (User {key['user_id']}, Key {key['key_id']}) 在第 {d} 天发起海量刷单 ({base_reqs} 级请求).")
 
             # 过滤无效负数请求
             base_reqs = max(0, base_reqs)
@@ -225,6 +253,10 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
                 minute = random.randint(0, 59)
                 second = random.randint(0, 59)
                 req_time = current_day.replace(hour=hour, minute=minute, second=second)
+                
+                # 业务规则：API 调用时间既不能早于创建时间（针对密钥创建当天的请求时间），也不能晚于当前时刻
+                if req_time < key['created_at'] or req_time > datetime.now():
+                    continue
                 
                 logs.append({
                     'request_id': request_id_counter,
@@ -308,7 +340,7 @@ def simulate_billing_orders(df_users, days=30):
                 billing_date += timedelta(days=30) # 每 30 天续费一次
 
         # 处理初始阶段到升级前 (或到现在) 的订阅费
-        # 如果有中途升级记录，则账单生成到升级日期结束（下一步会处理升级后的账单），否则则账单生成到当前时间
+        # 如果有中途升级记录，则账单生成到升级日期结束（下一步会处理升级后的账单）。如果没有中途升级记录，则账单生成到当前时间
         sub_end_limit = upgrade_date if pd.notna(upgrade_date) else datetime.now()
         add_subscription_fees(init_plan, reg_date, sub_end_limit)
             
@@ -329,45 +361,49 @@ def simulate_billing_orders(df_users, days=30):
             # 升级后的周期性订阅费（账单从升级日期开始，每 30 天续费一次）
             add_subscription_fees(curr_plan, upgrade_date, datetime.now())
             
-        # 随机零星充值和用量结算扣费 (使用时间锚点确保频率准确)
-        last_recharge_date = reg_date
-        current_time = reg_date + timedelta(days=random.randint(5, 10))
-        while current_time < datetime.now():
-            # 动态获取当前时刻的等级
+        # 随机零星充值 (独立循环：模拟用户余额不足时的补齐行为)
+        # 根据等级设定目标充值周期：Pro/Enterprise 约为 30 天，Free 为 7-15 天
+        recharge_time = reg_date + timedelta(days=random.randint(2, 5))
+        while recharge_time < datetime.now():
             acting_tier = init_plan
-            if pd.notna(upgrade_date) and current_time >= upgrade_date:
+            if pd.notna(upgrade_date) and recharge_time >= upgrade_date:
                 acting_tier = curr_plan
 
-            # 根据等级设定金额范围与目标充值周期
             if acting_tier == 'enterprise':
-                recharge_range = (500, 2000)
-                usage_range = (100, 500)
-                target_interval = 30
+                recharge_range, interval = (500, 2000), 30
             elif acting_tier == 'pro':
-                recharge_range = (50, 200)
-                usage_range = (10, 50)
-                target_interval = 30
+                recharge_range, interval = (50, 200), 30
             else:
-                recharge_range = (10, 30)
-                usage_range = (0.5, 5)
-                target_interval = 10
+                recharge_range, interval = (10, 30), random.randint(7, 15)
 
-            # 检查是否由于时间达标需要充值 (允许 ±2 天抖动)
-            if (current_time - last_recharge_date).days >= (target_interval + random.randint(-2, 2)):
-                orders.append({
-                    'order_id': order_id_counter,
-                    'user_id': user['user_id'],
-                    'amount': round(np.random.uniform(*recharge_range), 4),
-                    'order_type': 'recharge',
-                    'payment_method': 'credit_card',
-                    'transaction_status': 'completed',
-                    'created_at': current_time
-                })
-                order_id_counter += 1
-                last_recharge_date = current_time
-                
-            # 周期性结算
-            # 混合计费制 (Hybrid Model - 订阅费 + 额外用量)
+            orders.append({
+                'order_id': order_id_counter,
+                'user_id': user['user_id'],
+                'amount': round(np.random.uniform(*recharge_range), 4),
+                'order_type': 'recharge',
+                'payment_method': 'credit_card',
+                'transaction_status': 'completed',
+                'created_at': recharge_time
+            })
+            order_id_counter += 1
+            # 步进：目标周期 + 随机抖动 (确保 ±2 天抖动有效)
+            recharge_time += timedelta(days=max(1, interval + random.randint(-2, 2)))
+
+        # 周期性用量结算扣费 (独立循环：模拟混合计费模式下的后期结算)
+        # 结算通常是阈值驱动或高频小额，这里模拟为不固定的周期性结算 (4-10 天一次)
+        settlement_time = reg_date + timedelta(days=random.randint(3, 7))
+        while settlement_time < datetime.now():
+            acting_tier = init_plan
+            if pd.notna(upgrade_date) and settlement_time >= upgrade_date:
+                acting_tier = curr_plan
+
+            if acting_tier == 'enterprise':
+                usage_range = (100, 500)
+            elif acting_tier == 'pro':
+                usage_range = (10, 50)
+            else:
+                usage_range = (0.5, 5)
+
             orders.append({
                 'order_id': order_id_counter,
                 'user_id': user['user_id'],
@@ -375,18 +411,15 @@ def simulate_billing_orders(df_users, days=30):
                 'order_type': 'usage_settlement',
                 'payment_method': 'balance',
                 'transaction_status': 'completed',
-                'created_at': current_time + timedelta(hours=random.randint(1, 12))
+                'created_at': settlement_time + timedelta(hours=random.randint(1, 12))
             })
             order_id_counter += 1
-            
-            # 步进几天
-            # 结算一般是阈值驱动：例如，用户的欠费或消费达到了 $50，系统立即触发一次 balance 结算（这时，时间就是不固定的）。
-            current_time += timedelta(days=random.randint(4, 10))
+            # 步进：4-10 天模拟一次结算
+            settlement_time += timedelta(days=random.randint(4, 10))
             
     df_orders = pd.DataFrame(orders)
-    if not df_orders.empty:
-        df_orders = df_orders.sort_values(by='created_at').reset_index(drop=True)
-        df_orders['order_id'] = range(1, len(df_orders) + 1)
+    df_orders = df_orders.sort_values(by='created_at').reset_index(drop=True)
+    df_orders['order_id'] = range(1, len(df_orders) + 1)
     
     return df_orders
 
