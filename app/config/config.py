@@ -24,6 +24,8 @@ class AIModelConfig(BaseModel):
     provider: str
     input_price_per_1M: float
     output_price_per_1M: float
+    input_cost_per_1M: float
+    output_cost_per_1M: float
     max_context: int
 
 class GeneratorConfig(BaseModel):

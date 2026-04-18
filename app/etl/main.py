@@ -38,10 +38,14 @@ def extract_from_mysql(engine):
     df_users = pd.read_sql("SELECT * FROM users", engine)
     df_models = pd.read_sql("SELECT * FROM ai_models", engine)
     df_api_keys = pd.read_sql("SELECT key_id, user_id, key_name, is_active FROM api_keys", engine)
+    
+    # 新增：从 MySQL 抽取订阅变更记录，用于构建维度历史 (SCD2)
+    df_plan_changes = pd.read_sql("SELECT * FROM user_plan_changes", engine)
+    
     # 对于实际大数据量项目，这里会使用增量抽取。由于我们目前记录不多(10~20万)，全量抽取秒回
     df_logs = pd.read_sql("SELECT * FROM request_logs_raw", engine)
     df_billing = pd.read_sql("SELECT * FROM billing_orders", engine)
-    return df_users, df_models, df_api_keys, df_logs, df_billing
+    return df_users, df_models, df_api_keys, df_plan_changes, df_logs, df_billing
 
 def validate_and_clean(df_logs, df_billing):
     """
@@ -74,32 +78,66 @@ def validate_and_clean(df_logs, df_billing):
     
     return df_logs, df_billing
 
-def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billing):
+def transform_and_load(conn, df_users, df_models, df_api_keys, df_plan_changes, df_logs, df_billing):
     """在 DuckDB 内存中进行 Transform，并 Load 到星型架构事实表和维度表中"""
     logger.info("注册 DataFrame 到 DuckDB 进行内存级联算...")
     conn.register("src_users", df_users)
     conn.register("src_models", df_models)
     conn.register("src_api_keys", df_api_keys)
+    conn.register("src_plan_changes", df_plan_changes)
     conn.register("src_logs", df_logs)
     conn.register("src_billing", df_billing)
 
     # 1. 挂载和装配维度表: dim_model
     conn.execute("TRUNCATE TABLE dim_model")
     conn.execute("""
-        INSERT INTO dim_model (model_id, provider, input_price_per_1M, output_price_per_1M)
-        SELECT model_id, provider, input_price_per_1M, output_price_per_1M FROM src_models
+        INSERT INTO dim_model (model_id, provider, input_price_per_1M, output_price_per_1M, input_cost_per_1M, output_cost_per_1M)
+        SELECT model_id, provider, input_price_per_1M, output_price_per_1M, input_cost_per_1M, output_cost_per_1M FROM src_models
     """)
     logger.info("🔧 维度表 [dim_model] 装载完成.")
 
-    # 2. 挂载和装配维度表: dim_account
-    # (简化的 SCD Type 2：目前只装入 as is 状态，如果真有缓慢变化维此处可延伸)
+    # 2. 挂载和装配维度表: dim_account (SCD Type 2 历史还原)
     conn.execute("TRUNCATE TABLE dim_account")
     conn.execute("""
-        INSERT INTO dim_account (user_id, email, subscription_plan, valid_from, valid_to, is_current)
-        SELECT user_id, email, subscription_plan, registration_date, NULL, TRUE
-        FROM src_users
+        INSERT INTO dim_account (user_id, email, subscription_plan, registration_date, valid_from, valid_to, is_current)
+        WITH all_events AS (
+            -- 1. 获取所有状态开启的时间点
+            -- 注册时的初始状态
+            SELECT 
+                u.user_id, u.email, u.registration_date::TIMESTAMP as registration_date, -- 强制转换为微秒（DuckDB 与 Pandas 之间时间戳精度不一致）
+                COALESCE(first_c.old_plan, u.subscription_plan) as plan,
+                u.registration_date::TIMESTAMP as start_time
+            FROM src_users u
+            LEFT JOIN (
+                SELECT user_id, old_plan, 
+                       ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY change_date) as rn
+                FROM src_plan_changes
+            ) first_c ON u.user_id = first_c.user_id AND first_c.rn = 1
+            UNION ALL
+            -- 历次变更后的新状态
+            SELECT 
+                u.user_id, u.email, u.registration_date::TIMESTAMP as registration_date,
+                new_plan as plan,
+                change_date::TIMESTAMP as start_time
+            FROM src_plan_changes c
+            JOIN src_users u ON c.user_id = u.user_id
+        ),
+        timeline AS (
+            -- 2. 利用 LEAD 函数自动寻找下一个时间点作为本条记录的截止时间
+            SELECT 
+                *,
+                LEAD(start_time) OVER(PARTITION BY user_id ORDER BY start_time) as next_event_time
+            FROM all_events
+        )
+        -- 3. 最终装载：如果没有下一个事件，说明是当前状态
+        SELECT 
+            user_id, email, plan, registration_date,
+            start_time as valid_from,
+            COALESCE(next_event_time, CAST('9999-12-31' AS TIMESTAMP)) as valid_to,
+            CASE WHEN next_event_time IS NULL THEN TRUE ELSE FALSE END as is_current
+        FROM timeline
     """)
-    logger.info("🔧 维度表 [dim_account] 装载完成.")
+    logger.info("🔧 维度表 [dim_account] 装载完成 (已还原历史演变轨迹).")
 
     # 3. 挂载和装配辅助维度表: dim_status_code
     conn.execute("TRUNCATE TABLE dim_status_code")
@@ -127,7 +165,7 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billi
         INSERT INTO fct_api_requests (
             request_id, account_sk, model_sk, status_sk, key_sk,
             request_time, latency_ms, 
-            prompt_tokens, completion_tokens, cost_usd
+            prompt_tokens, completion_tokens, revenue_usd, cost_usd
         )
         SELECT 
             l.request_id,
@@ -139,9 +177,11 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billi
             l.latency_ms,
             l.prompt_token_count,
             l.completion_token_count,
-            -- 计算调用成本公式: tokens * price / 1_000_000
+            -- 计算调用收入 (Revenue) 与成本 (Cost) 公式: tokens * price / 1_000_000
             (l.prompt_token_count * m.input_price_per_1M / 1000000.0) + 
-            (l.completion_token_count * m.output_price_per_1M / 1000000.0) AS cost_usd
+            (l.completion_token_count * m.output_price_per_1M / 1000000.0) AS revenue_usd,
+            (l.prompt_token_count * m.input_cost_per_1M / 1000000.0) + 
+            (l.completion_token_count * m.output_cost_per_1M / 1000000.0) AS cost_usd
         FROM src_logs l
         -- 关联获得 user_id 及 Key 信息
         JOIN src_api_keys k_src ON l.key_id = k_src.key_id
@@ -183,13 +223,14 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billi
     conn.execute("TRUNCATE TABLE fct_account_daily_snapshot")
     conn.execute("""
         INSERT INTO fct_account_daily_snapshot (
-            snapshot_date, account_sk, daily_requests, daily_tokens, daily_cost_usd
+            snapshot_date, account_sk, daily_requests, daily_tokens, daily_revenue_usd, daily_cost_usd
         )
         SELECT 
             CAST(request_time AS DATE) AS snapshot_date,
             account_sk,
             COUNT(*) AS daily_requests,
             SUM(prompt_tokens + completion_tokens) AS daily_tokens,
+            SUM(revenue_usd) AS daily_revenue_usd,
             SUM(cost_usd) AS daily_cost_usd
         FROM fct_api_requests
         GROUP BY 1, 2
@@ -197,131 +238,6 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_logs, df_billi
     inserted_snapshots = conn.execute("SELECT COUNT(*) FROM fct_account_daily_snapshot").fetchone()[0]
     logger.info(f"📈 快照事实表 [fct_account_daily_snapshot] 装载完成: 共 {inserted_snapshots} 行记录.")
 
-    # 8. 注册指标元数据 (meta_metric)
-    logger.info("⚙️ 正在注册指标元数据 [meta_metric]...")
-    conn.execute("DELETE FROM meta_metric WHERE status = 'online'")
-    metrics_meta = [
-        ("account.monthly.total_calls",   "账户月度调用次数", "COUNT(*) FROM fct_api_requests GROUP BY account, month",                   "account", "month"),
-        ("account.monthly.total_tokens",  "账户月度 Token 用量", "SUM(prompt_tokens + completion_tokens) GROUP BY account, month",          "account", "month"),
-        ("account.monthly.api_cost",      "账户月度 API 成本",  "SUM(cost_usd) FROM fct_api_requests GROUP BY account, month",              "account", "month"),
-        ("account.monthly.revenue",       "账户月度充值收入",   "SUM(amount) WHERE amount > 0 FROM fct_account_transactions",               "account", "month"),
-        ("account.monthly.net_profit",    "账户月度净利润",    "revenue - api_cost",                                                        "account", "month"),
-        ("platform.monthly.total_calls",  "平台月度总调用次数", "COUNT(*) FROM fct_api_requests GROUP BY month",                             "platform", "month"),
-        ("platform.monthly.total_revenue","平台月度总收入",    "SUM(amount) WHERE amount > 0 FROM fct_account_transactions GROUP BY month", "platform", "month"),
-        ("platform.monthly.net_profit",   "平台月度净利润",    "total_revenue - total_cost",                                                "platform", "month"),
-    ]
-    for code, name, formula, etype, ttype in metrics_meta:
-        conn.execute("""
-            INSERT OR REPLACE INTO meta_metric (metric_code, metric_name, description, formula, entity_type, time_type, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'online')
-        """, [code, name, name, formula, etype, ttype])
-    logger.info(f"📋 指标元数据注册完成: 共 {len(metrics_meta)} 个指标.")
-
-    # 9. 生成 DWS 指标数值 (dws_metric_value) —— 指标中心化模型
-    logger.info("⚙️ 正在计算并写入 DWS 汇总指标 [dws_metric_value]...")
-    conn.execute("TRUNCATE TABLE dws_metric_value")
-
-    # 9.1 账户级月度指标 (5 个指标一次性计算)
-    conn.execute("""
-        WITH monthly_costs AS (
-            SELECT 
-                strftime('%Y-%m', request_time) as month_id,
-                account_sk,
-                COUNT(*) as calls,
-                SUM(prompt_tokens + completion_tokens) as tokens,
-                SUM(cost_usd) as cost
-            FROM fct_api_requests
-            GROUP BY 1, 2
-        ),
-        monthly_revenue AS (
-            SELECT 
-                strftime('%Y-%m', created_at) as month_id,
-                account_sk,
-                SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as revenue
-            FROM fct_account_transactions
-            WHERE transaction_status = 'completed'
-            GROUP BY 1, 2
-        ),
-        combined AS (
-            SELECT 
-                COALESCE(c.month_id, r.month_id) as month_id,
-                COALESCE(c.account_sk, r.account_sk) as account_sk,
-                COALESCE(c.calls, 0) as total_calls,
-                COALESCE(c.tokens, 0) as total_tokens,
-                COALESCE(c.cost, 0) as total_cost,
-                COALESCE(r.revenue, 0) as total_revenue
-            FROM monthly_costs c
-            FULL OUTER JOIN monthly_revenue r 
-              ON c.month_id = r.month_id AND c.account_sk = r.account_sk
-        )
-        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
-        SELECT metric_code, 'account', CAST(account_sk AS VARCHAR), 'month', month_id, val
-        FROM combined
-        UNPIVOT (
-            val FOR metric_code IN (
-                total_calls AS 'account.monthly.total_calls',
-                total_tokens AS 'account.monthly.total_tokens',
-                total_cost AS 'account.monthly.api_cost',
-                total_revenue AS 'account.monthly.revenue'
-            )
-        )
-    """)
-
-    # 9.2 账户级净利润 (revenue - cost，需要单独计算)
-    conn.execute("""
-        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
-        WITH profit AS (
-            SELECT 
-                COALESCE(c.month_id, r.month_id) as month_id,
-                COALESCE(c.account_sk, r.account_sk) as account_sk,
-                COALESCE(r.revenue, 0) - COALESCE(c.cost, 0) as net_profit
-            FROM (
-                SELECT strftime('%Y-%m', request_time) as month_id, account_sk, SUM(cost_usd) as cost
-                FROM fct_api_requests GROUP BY 1, 2
-            ) c
-            FULL OUTER JOIN (
-                SELECT strftime('%Y-%m', created_at) as month_id, account_sk,
-                       SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as revenue
-                FROM fct_account_transactions WHERE transaction_status = 'completed' GROUP BY 1, 2
-            ) r ON c.month_id = r.month_id AND c.account_sk = r.account_sk
-        )
-        SELECT 'account.monthly.net_profit', 'account', CAST(account_sk AS VARCHAR), 'month', month_id, net_profit
-        FROM profit
-    """)
-
-    # 9.3 平台级月度汇总指标
-    conn.execute("""
-        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
-        SELECT 'platform.monthly.total_calls', 'platform', 'ALL', 'month',
-               strftime('%Y-%m', request_time), COUNT(*)
-        FROM fct_api_requests GROUP BY 5
-    """)
-    conn.execute("""
-        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
-        SELECT 'platform.monthly.total_revenue', 'platform', 'ALL', 'month',
-               strftime('%Y-%m', created_at), SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END)
-        FROM fct_account_transactions WHERE transaction_status = 'completed' GROUP BY 5
-    """)
-    conn.execute("""
-        INSERT INTO dws_metric_value (metric_code, entity_type, entity_id, time_type, time_id, metric_value)
-        WITH platform_profit AS (
-            SELECT 
-                COALESCE(c.m, r.m) as month_id,
-                COALESCE(r.rev, 0) - COALESCE(c.cost, 0) as profit
-            FROM (SELECT strftime('%Y-%m', request_time) as m, SUM(cost_usd) as cost FROM fct_api_requests GROUP BY 1) c
-            FULL OUTER JOIN (
-                SELECT strftime('%Y-%m', created_at) as m,
-                       SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as rev
-                FROM fct_account_transactions WHERE transaction_status = 'completed' GROUP BY 1
-            ) r ON c.m = r.m
-        )
-        SELECT 'platform.monthly.net_profit', 'platform', 'ALL', 'month', month_id, profit
-        FROM platform_profit
-    """)
-
-    inserted_dws = conn.execute("SELECT COUNT(*) FROM dws_metric_value").fetchone()[0]
-    distinct_metrics = conn.execute("SELECT COUNT(DISTINCT metric_code) FROM dws_metric_value").fetchone()[0]
-    logger.info(f"📈 DWS 指标数值表 [dws_metric_value] 写入完成: 共 {inserted_dws} 行, 覆盖 {distinct_metrics} 个指标.")
 
 def run_etl():
     logger.info("=== 🚀 开始执行 ETL 批处理流水线 ===")
@@ -334,13 +250,13 @@ def run_etl():
         init_dw_schema(duckdb_conn)
         
         # 抽取 (Extract)
-        df_users, df_models, df_api_keys, df_logs_raw, df_billing_raw = extract_from_mysql(mysql_engine)
+        df_users, df_models, df_api_keys, df_plan_changes, df_logs_raw, df_billing_raw = extract_from_mysql(mysql_engine)
         
         # 清洗与校验 (Validate & Clean)
         df_logs, df_billing = validate_and_clean(df_logs_raw, df_billing_raw)
 
         # 转换并装载 (Transform & Load)
-        transform_and_load(duckdb_conn, df_users, df_models, df_api_keys, df_logs, df_billing)
+        transform_and_load(duckdb_conn, df_users, df_models, df_api_keys, df_plan_changes, df_logs, df_billing)
         
         duckdb_conn.close()
         logger.info("=== 🎉 ETL 流水线执行成功 (Data Warehouse 已就绪) ===")

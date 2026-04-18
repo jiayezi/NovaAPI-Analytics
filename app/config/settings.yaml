@@ -15,65 +15,89 @@ ai_models:
     provider: "OpenAI"
     input_price_per_1M: 2.50
     output_price_per_1M: 15.00
+    input_cost_per_1M: 2.00
+    output_cost_per_1M: 10.00
     max_context: 1050000
   - model_id: "gpt-5.4-pro"
     provider: "OpenAI"
     input_price_per_1M: 30.00
     output_price_per_1M: 180.00
+    input_cost_per_1M: 25.00
+    output_cost_per_1M: 150.00
     max_context: 1050000
   - model_id: "gpt-5.4-codex"
     provider: "OpenAI"
     input_price_per_1M: 2.50
     output_price_per_1M: 15.00
+    input_cost_per_1M: 1.80
+    output_cost_per_1M: 12.00
     max_context: 1050000
   - model_id: "gpt-4.1"
     provider: "OpenAI"
     input_price_per_1M: 2.50
     output_price_per_1M: 10.00
+    input_cost_per_1M: 1.50
+    output_cost_per_1M: 8.00
     max_context: 128000
   - model_id: "claude-sonnet-4-6"
     provider: "Anthropic"
     input_price_per_1M: 3.00
     output_price_per_1M: 15.00
+    input_cost_per_1M: 2.40
+    output_cost_per_1M: 12.00
     max_context: 200000
   - model_id: "claude-sonnet-4-6-thinking"
     provider: "Anthropic"
     input_price_per_1M: 3.00
     output_price_per_1M: 15.00
+    input_cost_per_1M: 2.40
+    output_cost_per_1M: 12.00
     max_context: 200000
   - model_id: "claude-opus-4-6"
     provider: "Anthropic"
     input_price_per_1M: 5.00
     output_price_per_1M: 25.00
+    input_cost_per_1M: 4.00
+    output_cost_per_1M: 20.00
     max_context: 200000
   - model_id: "claude-opus-4-6-thinking"
     provider: "Anthropic"
     input_price_per_1M: 5.00
     output_price_per_1M: 25.00
+    input_cost_per_1M: 4.00
+    output_cost_per_1M: 20.00
     max_context: 200000
   - model_id: "deepseek-v3.2"
     provider: "DeepSeek"
     input_price_per_1M: 0.28
     output_price_per_1M: 0.42
+    input_cost_per_1M: 0.15
+    output_cost_per_1M: 0.25
     max_context: 128000
   - model_id: "deepseek-v3.2-exp"
     provider: "DeepSeek"
     input_price_per_1M: 0.28
     output_price_per_1M: 0.42
+    input_cost_per_1M: 0.15
+    output_cost_per_1M: 0.25
     max_context: 128000
   - model_id: "gemini-3-flash-preview"
     provider: "Google"
     input_price_per_1M: 0.50
     output_price_per_1M: 3.00
+    input_cost_per_1M: 0.35
+    output_cost_per_1M: 2.00
     max_context: 1000000
   - model_id: "gemini-3.1-pro-preview"
     provider: "Google"
     input_price_per_1M: 2.00
     output_price_per_1M: 12.00
+    input_cost_per_1M: 1.50
+    output_cost_per_1M: 9.00
     max_context: 2000000
 
 # 数据生成器配置
 generator:
-  initial_users: 99
+  initial_users: 150
   max_keys_per_user: 3
   simulation_days: 90

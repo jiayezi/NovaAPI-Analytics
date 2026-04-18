@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS dim_account (
     user_id INTEGER,
     email VARCHAR,
     subscription_plan VARCHAR,
+    registration_date TIMESTAMP,
     valid_from TIMESTAMP,
     valid_to TIMESTAMP,
     is_current BOOLEAN
@@ -22,7 +23,9 @@ CREATE TABLE IF NOT EXISTS dim_model (
     model_id VARCHAR,
     provider VARCHAR,
     input_price_per_1M DOUBLE,
-    output_price_per_1M DOUBLE
+    output_price_per_1M DOUBLE,
+    input_cost_per_1M DOUBLE,
+    output_cost_per_1M DOUBLE
 );
 
 CREATE SEQUENCE IF NOT EXISTS seq_status_sk START 1;
@@ -57,6 +60,7 @@ CREATE TABLE IF NOT EXISTS fct_api_requests (
     latency_ms INTEGER,
     prompt_tokens INTEGER,
     completion_tokens INTEGER,
+    revenue_usd DOUBLE,
     cost_usd DOUBLE
 );
 
@@ -77,6 +81,7 @@ CREATE TABLE IF NOT EXISTS fct_account_daily_snapshot (
     account_sk INTEGER,
     daily_requests INTEGER,
     daily_tokens INTEGER,
+    daily_revenue_usd DOUBLE,
     daily_cost_usd DOUBLE,
     PRIMARY KEY (snapshot_date, account_sk)
 );

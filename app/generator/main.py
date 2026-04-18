@@ -34,6 +34,8 @@ def generate_reference_data():
             'provider': m.provider,
             'input_price_per_1M': m.input_price_per_1M,
             'output_price_per_1M': m.output_price_per_1M,
+            'input_cost_per_1M': m.input_cost_per_1M,
+            'output_cost_per_1M': m.output_cost_per_1M,
             'max_context': m.max_context,
             'is_available': True
         })

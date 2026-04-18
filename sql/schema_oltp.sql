@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS `ai_models` (
     `provider` VARCHAR(50) NOT NULL COMMENT '提供商 (OpenAI, Anthropic, etc.)',
     `input_price_per_1M` DECIMAL(10, 6) NOT NULL COMMENT '每 1M 输入 Token 价格 (USD)',
     `output_price_per_1M` DECIMAL(10, 6) NOT NULL COMMENT '每 1M 输出 Token 价格 (USD)',
+    `input_cost_per_1M` DECIMAL(10, 6) NOT NULL COMMENT '每 1M 输入 Token 成本 (USD)',
+    `output_cost_per_1M` DECIMAL(10, 6) NOT NULL COMMENT '每 1M 输出 Token 成本 (USD)',
     `max_context` INT NOT NULL COMMENT '最大上下文长度',
     `is_available` BOOLEAN NOT NULL DEFAULT TRUE COMMENT '模型当前是否可用'
 ) ENGINE=InnoDB COMMENT='AI 模型配置及价格表';

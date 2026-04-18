@@ -1,4 +1,4 @@
-﻿# NovaAPI-Analytics 项目概览 (Project Overview)
+# NovaAPI-Analytics 项目概览 (Project Overview)
 
 本文件汇总了“AI API 平台 SaaS”数据平台项目的核心背景、技术架构及开发规划，旨在为后续开发提供参考。
 
@@ -73,16 +73,27 @@
 NovaAPI-Analytics/
 ├── app/
 │   ├── config/
-│   │   ├── config.py       # 读取逻辑
-│   │   └── settings.yaml   # 配置文件
-│   ├── generator/          # 数据模拟器模块
-│   ├── etl/                # ETL/ELT 逻辑 (MySQL -> DuckDB)
-│   └── analytics/          # 统计学分析与 AI 诊断逻辑
-├── sql/
-│   ├── schema_oltp.sql     # MySQL DDL
-│   └── schema_dw.sql       # DuckDB DDL
-├── data/                   # 存放 DuckDB 数据库文件
-└── requirements.txt
+│   │   ├── config.py           # 配置读取逻辑 (Pydantic)
+│   │   └── settings.yaml       # 模型、定价及生成器设置
+│   ├── generator/              # 数据模拟器 (ODS 层)
+│   │   └── main.py             # 仿真生成 90 天的用户、订单与调用日志
+│   ├── etl/                    # ETL 批处理流水线 (DW 层)
+│   │   └── main.py             # MySQL -> DuckDB 的数据清洗与事实表装载
+│   └── calculation/            # 指标计算引擎 (ADS 层/指标中心)
+│       ├── core.py             # 核心框架 (Registry, 基类, Context)
+│       ├── orchestrator.py     # 任务编排器 (驱动多阶段计算)
+│       ├── data_utils.py       # 跨模型数据读取工具
+│       └── calculators/        # 插件化指标检测器 (按需扩展指标)
+├── docs/                       # 系统设计与分析指南
+│   ├── project_overview.md
+│   ├── analytics_metrics_guide.md  # 指标定义指南
+│   └── 数据计算模块系统设计.md
+├── sql/                        # 数据库 DDL 脚本
+│   ├── schema_oltp.sql         # 业务库结构 (MySQL)
+│   └── schema_dw.sql           # 数据仓库结构 (DuckDB)
+├── data/                       # 存放 DuckDB 本地数据库文件
+├── requirements.txt            # 项目依赖
+└── .env                        # 敏感环境变量 (Local Only)
 ```
 
 ---
