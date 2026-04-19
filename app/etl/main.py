@@ -223,20 +223,46 @@ def transform_and_load(conn, df_users, df_models, df_api_keys, df_plan_changes, 
     conn.execute("TRUNCATE TABLE fct_account_daily_snapshot")
     conn.execute("""
         INSERT INTO fct_account_daily_snapshot (
-            snapshot_date, account_sk, daily_requests, daily_tokens, daily_revenue_usd, daily_cost_usd
+            snapshot_date, account_sk, daily_requests, sum_prompt_tokens, sum_completion_tokens, daily_revenue_usd, daily_cost_usd
         )
         SELECT 
             CAST(request_time AS DATE) AS snapshot_date,
             account_sk,
             COUNT(*) AS daily_requests,
-            SUM(prompt_tokens + completion_tokens) AS daily_tokens,
+            SUM(prompt_tokens) AS sum_prompt_tokens,
+            SUM(completion_tokens) AS sum_completion_tokens,
             SUM(revenue_usd) AS daily_revenue_usd,
             SUM(cost_usd) AS daily_cost_usd
         FROM fct_api_requests
         GROUP BY 1, 2
     """)
-    inserted_snapshots = conn.execute("SELECT COUNT(*) FROM fct_account_daily_snapshot").fetchone()[0]
-    logger.info(f"📈 快照事实表 [fct_account_daily_snapshot] 装载完成: 共 {inserted_snapshots} 行记录.")
+    inserted_account_snapshots = conn.execute("SELECT COUNT(*) FROM fct_account_daily_snapshot").fetchone()[0]
+    logger.info(f"📈 账户快照表 [fct_account_daily_snapshot] 装载完成: 共 {inserted_account_snapshots} 行记录.")
+
+    # 7. 生成聚合快照事实表: fct_model_daily_snapshot
+    logger.info("⚙️ 正在降维聚合生成每日快照事实表 [fct_model_daily_snapshot]...")
+    conn.execute("TRUNCATE TABLE fct_model_daily_snapshot")
+    conn.execute("""
+        INSERT INTO fct_model_daily_snapshot (
+            snapshot_date, model_sk, daily_requests, sum_prompt_tokens, sum_completion_tokens, 
+            daily_revenue_usd, daily_cost_usd, sum_latency_ms, error_requests
+        )
+        SELECT 
+            CAST(r.request_time AS DATE) AS snapshot_date,
+            r.model_sk,
+            COUNT(*) AS daily_requests,
+            SUM(r.prompt_tokens) AS sum_prompt_tokens,
+            SUM(r.completion_tokens) AS sum_completion_tokens,
+            SUM(r.revenue_usd) AS daily_revenue_usd,
+            SUM(r.cost_usd) AS daily_cost_usd,
+            SUM(r.latency_ms) AS sum_latency_ms,
+            SUM(CASE WHEN s.is_error THEN 1 ELSE 0 END) AS error_requests
+        FROM fct_api_requests r
+        JOIN dim_status_code s ON r.status_sk = s.status_sk
+        GROUP BY 1, 2
+    """)
+    inserted_model_snapshots = conn.execute("SELECT COUNT(*) FROM fct_model_daily_snapshot").fetchone()[0]
+    logger.info(f"📈 模型快照表 [fct_model_daily_snapshot] 装载完成: 共 {inserted_model_snapshots} 行记录.")
 
 
 def run_etl():

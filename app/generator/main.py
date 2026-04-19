@@ -184,6 +184,25 @@ def simulate_request_logs(df_keys, df_users, df_models, days=30):
             # 动态支持 SCD2：如果用户有升级记录但数据模拟器生成当前请求日志时还没到升级日期，就使用初始的 Plan（升级前和升级后的请求数量和模型偏好是不同的）
             if pd.notna(user.get('_upgrade_date')) and current_day < user['_upgrade_date']:
                 tier = user.get('_initial_plan', tier)
+            
+            # 留存模拟逻辑 (Retention Decay)
+            # 计算用户已注册天数
+            days_since_reg = (current_day.date() - user['registration_date'].date()).days
+            
+            # 根据等级设定活跃概率 (随着注册时间增加而下降)
+            if tier == 'free':
+                # 免费用户流失极快：30天后活跃度降至 20%
+                active_prob = max(0.05, 1.0 - (days_since_reg / 40.0)) 
+            elif tier == 'pro':
+                # Pro 用户较稳定：日活保持在 60% 以上
+                active_prob = max(0.6, 1.0 - (days_since_reg / 150.0))
+            else:
+                # 企业用户几乎 100% 留存
+                active_prob = 0.98
+
+            # 概率判定：如果随机抽样未中，则该用户今天处于“静默期”或已流失
+            if random.random() > active_prob:
+                continue
                 
             # 用户一天发多少请求？根据等级决定
             if tier == 'enterprise':

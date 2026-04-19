@@ -80,10 +80,25 @@ CREATE TABLE IF NOT EXISTS fct_account_daily_snapshot (
     snapshot_date DATE,
     account_sk INTEGER,
     daily_requests INTEGER,
-    daily_tokens INTEGER,
+    sum_prompt_tokens BIGINT,
+    sum_completion_tokens BIGINT,
     daily_revenue_usd DOUBLE,
     daily_cost_usd DOUBLE,
     PRIMARY KEY (snapshot_date, account_sk)
+);
+
+-- 2.4 模型服务质量每日快照事实表
+CREATE TABLE IF NOT EXISTS fct_model_daily_snapshot (
+    snapshot_date DATE,
+    model_sk INTEGER,
+    daily_requests INTEGER,
+    sum_prompt_tokens BIGINT,
+    sum_completion_tokens BIGINT,
+    daily_revenue_usd DOUBLE,
+    daily_cost_usd DOUBLE,
+    sum_latency_ms BIGINT,       -- 总延迟，用于计算平均响应时间
+    error_requests INTEGER,      -- 错误请求数 (HTTP >= 400)
+    PRIMARY KEY (snapshot_date, model_sk)
 );
 
 -- ==========================================
